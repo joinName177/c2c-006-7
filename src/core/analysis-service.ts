@@ -1,6 +1,88 @@
-import{normalizeWeights}from'./weight-service';import{VALUE_KEYS,VALUE_LABELS,type DecisionAnalysis,type DecisionDraft,type Horizon,type OptionAnalysis,type RegretPoint,type RehearsalCard,type ValueKey}from'./models';
-const timeFactor:Record<Horizon,Record<ValueKey,number>>={1:{stability:1.2,growth:.75,freedom:.8,money:1.15},5:{stability:1,growth:1,freedom:1,money:1},10:{stability:.8,growth:1.25,freedom:1.2,money:.85}};
-function point(option:DecisionDraft['options'][number],weights:ReturnType<typeof normalizeWeights>,horizon:Horizon):RegretPoint{const breakdown={}as RegretPoint['breakdown'];let total=0;for(const key of VALUE_KEYS){const negative=(5-option.impacts[key])/10;const value=negative*weights[key]*timeFactor[horizon][key];breakdown[key]=Math.round(value*10)/10;total+=value}const irreversible=(100-option.reversibility)*.08*(horizon/10);return{horizon,score:Math.max(0,Math.min(100,Math.round(total+irreversible))),breakdown}}
-function card(option:DecisionDraft['options'][number],p:RegretPoint,weights:ReturnType<typeof normalizeWeights>):RehearsalCard{const key=VALUE_KEYS.slice().sort((a,b)=>weights[b]*(5-option.impacts[b])-weights[a]*(5-option.impacts[a]))[0];const label=VALUE_LABELS[key];return{horizon:p.horizon,regret:`${p.horizon} 年后，你可能遗憾「${option.name}」没有更好照顾${label}。`,trigger:`当${label}需求持续得不到满足，后悔感可能升高。`,reversibility:option.reversibility>=60?'仍有较大调整空间':'改变成本可能随时间增加',action:`现在就为${label}设一个可检查的阶段目标。`}}
-export function safetyNoticesFor(text:string):string[]{const notices:string[]=[];if(/医疗|诊断|治疗|medical/i.test(text))notices.push('涉及医疗，请同时咨询合格医疗专业人士。');if(/法律|诉讼|合同|legal/i.test(text))notices.push('涉及法律，请同时咨询合格法律专业人士。');if(/投资|股票|理财|investment/i.test(text))notices.push('涉及投资，请评估承受能力并咨询持牌专业人士。');return notices}
-export function analyzeDecision(draft:DecisionDraft):DecisionAnalysis{const weights=normalizeWeights(draft.weights);const options:OptionAnalysis[]=draft.options.map(option=>{const points=([1,5,10]as Horizon[]).map(h=>point(option,weights,h));return{option,points,cards:points.map(p=>card(option,p,weights)),total:Math.round(points[0].score*.3+points[1].score*.4+points[2].score*.3)}}).sort((a,b)=>a.total-b.total);const close=options[1]&&options[1].total-options[0].total<5;return{options,recommendation:close?`「${options[0].option.name}」与「${options[1].option.name}」非常接近，建议补充信息后再决定。`:`目前看，「${options[0].option.name}」是更不容易后悔的方向。`,winnerId:close?undefined:options[0].option.id,notices:safetyNoticesFor(`${draft.title} ${draft.background}`)}}
+import { normalizeWeights } from './weight-service';
+import {
+  CLOSE_GAP,
+  DISPLAY_HALF_STEP,
+  roundHalfUp,
+  scoreOption,
+} from './regret-engine';
+import { safetyNoticesFor } from './safety-notice';
+import {
+  VALUE_KEYS,
+  type DecisionAnalysis,
+  type DecisionDraft,
+  type ValueWeights,
+} from './models';
+
+/** 稳定的 32 位字符串哈希（FNV-1a），用于给输入与某次分析打指纹 */
+export function stableHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/** 由全部会影响评分的输入生成签名；与展示性字段（背景说明等）无关 */
+export function signatureFor(draft: DecisionDraft): string {
+  const payload = JSON.stringify({
+    w: VALUE_KEYS.map((k) => draft.weights[k]),
+    o: draft.options.map((o) => [
+      o.name,
+      o.reversibility,
+      VALUE_KEYS.map((k) => o.impacts[k]),
+    ]),
+  });
+  return stableHash(payload);
+}
+
+export interface AnalysisMeta {
+  /** 由调用方（界面/控制器）提供时间戳；核心层不读取系统时间 */
+  generatedAt?: string;
+  id?: string;
+}
+
+/**
+ * 对一份草稿执行一次推演。结果不可变，并带唯一 id、时间戳与输入签名，
+ * 让比较和保存的报告都能声明自己依据的是“哪一次分析”。
+ */
+export function analyzeDecision(draft: DecisionDraft, meta: AnalysisMeta = {}): DecisionAnalysis {
+  const weights: ValueWeights = normalizeWeights(draft.weights);
+  const inputSignature = signatureFor(draft);
+  const generatedAt = meta.generatedAt ?? new Date(0).toISOString();
+  const id = meta.id ?? `analysis-${stableHash(`${inputSignature}:${generatedAt}`)}`;
+
+  const options = draft.options
+    .map((option) => scoreOption(option, weights))
+    .sort((a, b) => {
+      if (a.totalRaw !== b.totalRaw) return a.totalRaw - b.totalRaw;
+      if (a.option.name !== b.option.name) return a.option.name.localeCompare(b.option.name);
+      return a.option.id.localeCompare(b.option.id);
+    });
+
+  const gap = options.length > 1 ? options[1].totalRaw - options[0].totalRaw : Infinity;
+  // 并列与“接近”都用精确值判断，整数总分不再参与任何决策
+  const tied = options.length > 1 && gap < DISPLAY_HALF_STEP;
+  const close = options.length > 1 && gap < CLOSE_GAP;
+  const winnerId = !tied && !close ? options[0].option.id : undefined;
+
+  const leader = options[0].option.name;
+  const runnerUp = options[1]?.option.name;
+  const recommendation = tied
+    ? `「${leader}」与「${runnerUp}」精确总分差不足 ${DISPLAY_HALF_STEP} 分，实质并列；调整一点权重或补充一条信息，顺序就可能改变。`
+    : close
+      ? `「${leader}」与「${runnerUp}」非常接近（精确差 ${roundHalfUp(gap, 1)} 分），建议补充信息后再决定。`
+      : `目前看，「${leader}」是更不容易后悔的方向。`;
+
+  return {
+    id,
+    generatedAt,
+    inputSignature,
+    options,
+    recommendation,
+    winnerId,
+    tied,
+    notices: safetyNoticesFor(`${draft.title} ${draft.background}`),
+    weights,
+  };
+}
